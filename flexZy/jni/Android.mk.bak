@@ -1,0 +1,32 @@
+LOCAL_PATH := $(call my-dir)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := flexzy
+LOCAL_SRC_FILES := \
+    Module.cpp \
+    Cheat.cpp \
+    Hooks.cpp \
+    Input.cpp \
+    Menu.cpp \
+    xdl/xdl.c \
+    xdl/xdl_iterate.c \
+    xdl/xdl_linker.c \
+    xdl/xdl_lzma.c \
+    xdl/xdl_util.c \
+    imgui/imgui.cpp \
+    imgui/imgui_draw.cpp \
+    imgui/imgui_tables.cpp \
+    imgui/imgui_widgets.cpp \
+    imgui/imgui_impl_opengl3.cpp \
+    imgui/imgui_impl_android.cpp
+
+LOCAL_C_INCLUDES := \
+    $(LOCAL_PATH)/imgui \
+    $(LOCAL_PATH)/xdl \
+    $(LOCAL_PATH)/xdl/include
+
+LOCAL_LDLIBS := -llog -lEGL -lGLESv3 -landroid -ljnigraphics
+LOCAL_CPPFLAGS := -std=c++17 -fno-exceptions -fno-rtti -O2
+LOCAL_CFLAGS := -O2
+
+include $(BUILD_SHARED_LIBRARY)

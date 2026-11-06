@@ -1,0 +1,7 @@
+id=flexcity_zygisk
+name=FlexCity Zygisk
+version=v1.0
+versionCode=1
+author=He
+description=Internal cheat for Vice Online
+zygisk=1

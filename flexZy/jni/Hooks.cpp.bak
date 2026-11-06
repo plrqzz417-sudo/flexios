@@ -1,0 +1,275 @@
+#include "Hooks.h"
+#include "Cheat.h"
+#include "Menu.h"
+#include "imgui.h"
+#include "imgui_impl_opengl3.h"
+#include "flexhandler_dex.h"
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+#include <android/input.h>
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <mutex>
+#include <atomic>
+#include <cstring>
+#include <cmath>
+#include <jni.h>
+
+static std::atomic<bool> g_overlay_visible{true};
+static std::once_flag g_gl_once;
+static ANativeWindow* g_window = nullptr;
+static EGLDisplay g_display = EGL_NO_DISPLAY;
+static EGLSurface g_surface = EGL_NO_SURFACE;
+static EGLContext g_context = EGL_NO_CONTEXT;
+static std::atomic<bool> g_render_running{false};
+
+static TargetData g_targets[64];
+static int g_target_count = 0;
+static std::mutex g_targets_mtx;
+
+void SetOverlayVisible(bool v) { g_overlay_visible = v; }
+bool IsOverlayVisible() { return g_overlay_visible; }
+
+void SetRenderTargets(const TargetData* src, int count) {
+    std::lock_guard<std::mutex> lk(g_targets_mtx);
+    if (count > 64) count = 64;
+    g_target_count = count;
+    if (count > 0) memcpy(g_targets, src, sizeof(TargetData) * count);
+}
+
+RenderTargets GetRenderTargets() {
+    std::lock_guard<std::mutex> lk(g_targets_mtx);
+    RenderTargets rt;
+    rt.data = g_targets;
+    rt.count = g_target_count;
+    return rt;
+}
+
+static void init_gl_once() {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    ImGui_ImplOpenGL3_Init("#version 300 es");
+    LOGI("ImGui init OK");
+}
+
+static void render_menu_and_esp(int w, int h) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)w, (float)h);
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui::NewFrame();
+
+    Menu_Render();
+
+    RenderTargets rt = GetRenderTargets();
+    Matrix4x4 vm = Cheat_GetViewMatrix();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    for (int i = 0; i < rt.count; i++) {
+        TargetData& t = rt.data[i];
+        if (!t.valid || t.is_local) continue;
+        float vx = t.head.x, vy = t.head.y, vz = t.head.z;
+        float cw = vm.m[3]*vx + vm.m[7]*vy + vm.m[11]*vz + vm.m[15];
+        if (cw <= 0.001f) continue;
+        float cx = (vm.m[0]*vx + vm.m[4]*vy + vm.m[8]*vz + vm.m[12]) / cw;
+        float cy = (vm.m[1]*vx + vm.m[5]*vy + vm.m[9]*vz + vm.m[13]) / cw;
+        float sx = (cx * 0.5f + 0.5f) * w;
+        float sy = (cy * 0.5f + 0.5f) * h;
+        float fx = t.pos.x, fy = t.pos.y, fz = t.pos.z;
+        float fcw = vm.m[3]*fx + vm.m[7]*fy + vm.m[11]*fz + vm.m[15];
+        if (fcw <= 0.001f) continue;
+        float fcx = (vm.m[0]*fx + vm.m[4]*fy + vm.m[8]*fz + vm.m[12]) / fcw;
+        float fcy = (vm.m[1]*fx + vm.m[5]*fy + vm.m[9]*fz + vm.m[13]) / fcw;
+        float fsy = (fcy * 0.5f + 0.5f) * h;
+        float bh = fabsf(fsy - sy);
+        if (bh < 5 || bh > 2000) continue;
+        float bw = bh * 0.25f;
+        if (g_cfg.esp_box) dl->AddRect(ImVec2(sx - bw, sy), ImVec2(sx + bw, fsy), IM_COL32(255, 0, 0, 255), 0, 0, 1.5f);
+        if (g_cfg.esp_health && t.maxHp > 0) {
+            float hp_pct = (float)t.hp / (float)t.maxHp;
+            float hp_h = bh * hp_pct;
+            dl->AddRectFilled(ImVec2(sx - bw - 5, fsy - hp_h), ImVec2(sx - bw - 2, fsy), IM_COL32(0, 255, 0, 255));
+        }
+        if (g_cfg.esp_name && t.name[0]) dl->AddText(ImVec2(sx - bw, sy - 15), IM_COL32(255, 255, 255, 255), t.name);
+        if (g_cfg.esp_line) dl->AddLine(ImVec2(w * 0.5f, h), ImVec2(sx, fsy), IM_COL32(255, 255, 255, 200), 1.f);
+    }
+
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+}
+
+static void* render_thread(void* arg) {
+    LOGI("render thread iniciada");
+    EGLint major, minor;
+    g_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(g_display, &major, &minor);
+
+    EGLint attribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 0, EGL_STENCIL_SIZE, 0,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint num_configs;
+    eglChooseConfig(g_display, attribs, &config, 1, &num_configs);
+    if (num_configs == 0) { LOGI("eglChooseConfig falhou"); return nullptr; }
+
+    EGLint context_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    g_context = eglCreateContext(g_display, config, EGL_NO_CONTEXT, context_attribs);
+
+    while (g_render_running) {
+        if (!g_window) { usleep(16000); continue; }
+        if (g_surface == EGL_NO_SURFACE) {
+            g_surface = eglCreateWindowSurface(g_display, config, g_window, nullptr);
+            if (g_surface == EGL_NO_SURFACE) { usleep(16000); continue; }
+            eglMakeCurrent(g_display, g_surface, g_surface, g_context);
+            std::call_once(g_gl_once, init_gl_once);
+        }
+        if (!g_overlay_visible) { usleep(16000); continue; }
+        if (!ImGui::GetCurrentContext()) { usleep(16000); continue; }
+
+        EGLint w = ANativeWindow_getWidth(g_window);
+        EGLint h = ANativeWindow_getHeight(g_window);
+        if (w <= 0 || h <= 0) { usleep(16000); continue; }
+
+        glViewport(0, 0, w, h);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        render_menu_and_esp(w, h);
+        eglSwapBuffers(g_display, g_surface);
+        usleep(16000);
+    }
+    return nullptr;
+}
+
+// ─── Touch handler nativo ───
+static jobject native_on_touch(JNIEnv* env, jclass cls, jobjectArray args) {
+    jobject motion_event = env->GetObjectArrayElement(args, 1);
+    if (!motion_event) return nullptr;
+    jclass me_cls = env->GetObjectClass(motion_event);
+    jmethodID get_action = env->GetMethodID(me_cls, "getAction", "()I");
+    jmethodID get_x = env->GetMethodID(me_cls, "getX", "()F");
+    jmethodID get_y = env->GetMethodID(me_cls, "getY", "()F");
+    jint action = env->CallIntMethod(motion_event, get_action);
+    jfloat x = env->CallFloatMethod(motion_event, get_x);
+    jfloat y = env->CallFloatMethod(motion_event, get_y);
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(x, y);
+    switch (action & 0xFF) {
+        case 0: io.AddMouseButtonEvent(0, true); break;   // ACTION_DOWN
+        case 1: io.AddMouseButtonEvent(0, false); break;  // ACTION_UP
+        case 2: break;                                     // ACTION_MOVE
+    }
+    return nullptr;
+}
+
+// ─── Cria SurfaceView + touch listener ───
+static bool create_overlay_surface(JNIEnv* env) {
+    // ActivityThread
+    jclass at_cls = env->FindClass("android/app/ActivityThread");
+    jmethodID current_at = env->GetStaticMethodID(at_cls, "currentActivityThread", "()Landroid/app/ActivityThread;");
+    jobject at = env->CallStaticObjectMethod(at_cls, current_at);
+    jfieldID mActivities_field = env->GetFieldID(at_cls, "mActivities", "Landroid/util/ArrayMap;");
+    jobject activities = env->GetObjectField(at, mActivities_field);
+    jclass am_cls = env->FindClass("android/util/ArrayMap");
+    jmethodID size_m = env->GetMethodID(am_cls, "size", "()I");
+    jmethodID value_at = env->GetMethodID(am_cls, "valueAt", "(I)Ljava/lang/Object;");
+    if (env->CallIntMethod(activities, size_m) == 0) { LOGI("Sem activity"); return false; }
+    jobject acr = env->CallObjectMethod(activities, value_at, 0);
+    jclass acr_cls = env->GetObjectClass(acr);
+    jfieldID activity_field = env->GetFieldID(acr_cls, "activity", "Landroid/app/Activity;");
+    jobject activity = env->GetObjectField(acr, activity_field);
+    if (!activity) { LOGI("Activity nula"); return false; }
+
+    // SurfaceView
+    jclass sv_cls = env->FindClass("android/view/SurfaceView");
+    jmethodID sv_ctor = env->GetMethodID(sv_cls, "<init>", "(Landroid/content/Context;)V");
+    jobject surface_view = env->NewObject(sv_cls, sv_ctor, activity);
+
+    jmethodID set_z = env->GetMethodID(sv_cls, "setZOrderOnTop", "(Z)V");
+    env->CallVoidMethod(surface_view, set_z, JNI_TRUE);
+
+    jmethodID get_holder = env->GetMethodID(sv_cls, "getHolder", "()Landroid/view/SurfaceHolder;");
+    jobject holder = env->CallObjectMethod(surface_view, get_holder);
+    jclass holder_cls = env->GetObjectClass(holder);
+    jmethodID set_format = env->GetMethodID(holder_cls, "setFormat", "(I)V");
+    jclass pf_cls = env->FindClass("android/graphics/PixelFormat");
+    jint translucent = env->GetStaticIntField(pf_cls, env->GetStaticFieldID(pf_cls, "TRANSLUCENT", "I"));
+    env->CallVoidMethod(holder, set_format, translucent);
+
+    // Adiciona na DecorView da Activity (sem permissão de overlay)
+    jmethodID get_window = env->GetMethodID(env->GetObjectClass(activity), "getWindow", "()Landroid/view/Window;");
+    jobject window = env->CallObjectMethod(activity, get_window);
+    jmethodID get_decor = env->GetMethodID(env->GetObjectClass(window), "getDecorView", "()Landroid/view/View;");
+    jobject decor = env->CallObjectMethod(window, get_decor);
+    jclass vg_cls = env->FindClass("android/view/ViewGroup");
+    jmethodID add_view = env->GetMethodID(vg_cls, "addView", "(Landroid/view/View;)V");
+    env->CallVoidMethod(decor, add_view, surface_view);
+
+    // Carrega FlexHandler do dex embutido
+    jclass imdcl_cls = env->FindClass("dalvik/system/InMemoryDexClassLoader");
+    jmethodID imdcl_ctor = env->GetMethodID(imdcl_cls, "<init>", "([BLjava/lang/ClassLoader;)V");
+    jclass bb_cls = env->FindClass("java/nio/ByteBuffer");
+    jmethodID wrap = env->GetStaticMethodID(bb_cls, "wrap", "([B)Ljava/nio/ByteBuffer;");
+    jbyteArray dex_arr = env->NewByteArray(classes_dex_len);
+    env->SetByteArrayRegion(dex_arr, 0, classes_dex_len, (const jbyte*)classes_dex);
+    jobject buffer = env->CallStaticObjectMethod(bb_cls, wrap, dex_arr);
+    jclass cl_cls = env->FindClass("java/lang/ClassLoader");
+    jmethodID get_sys_cl = env->GetStaticMethodID(cl_cls, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+    jobject parent_loader = env->CallStaticObjectMethod(cl_cls, get_sys_cl);
+    jobject dex_loader = env->NewObject(imdcl_cls, imdcl_ctor, buffer, parent_loader);
+
+    // Carrega flexzy.FlexHandler
+    jmethodID load_class = env->GetMethodID(cl_cls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring fh_name = env->NewStringUTF("flexzy.FlexHandler");
+    jclass fh_cls = (jclass)env->CallObjectMethod(dex_loader, load_class, fh_name);
+
+    // Registra nativeOnTouch
+    JNINativeMethod methods[] = {
+        {(char*)"nativeOnTouch", (char*)"([Ljava/lang/Object;)Ljava/lang/Object;", (void*)native_on_touch}
+    };
+    env->RegisterNatives(fh_cls, methods, 1);
+
+    // Cria instância
+    jmethodID fh_ctor = env->GetMethodID(fh_cls, "<init>", "()V");
+    jobject fh = env->NewObject(fh_cls, fh_ctor);
+
+    // Proxy do OnTouchListener
+    jclass proxy_cls = env->FindClass("java/lang/reflect/Proxy");
+    jmethodID new_proxy = env->GetStaticMethodID(proxy_cls, "newProxyInstance", "(Ljava/lang/ClassLoader;[Ljava/lang/Class;Ljava/lang/reflect/InvocationHandler;)Ljava/lang/Object;");
+    jclass otl_cls = env->FindClass("android/view/View$OnTouchListener");
+    jobjectArray ifaces = env->NewObjectArray(1, env->FindClass("java/lang/Class"), otl_cls);
+    jobject touch_listener = env->CallStaticObjectMethod(proxy_cls, new_proxy, dex_loader, ifaces, fh);
+
+    jmethodID set_otl = env->GetMethodID(sv_cls, "setOnTouchListener", "(Landroid/view/View$OnTouchListener;)V");
+    env->CallVoidMethod(surface_view, set_otl, touch_listener);
+
+    // Pega a Surface
+    jmethodID get_surface = env->GetMethodID(holder_cls, "getSurface", "()Landroid/view/Surface;");
+    jobject surface = env->CallObjectMethod(holder, get_surface);
+    if (surface) {
+        g_window = ANativeWindow_fromSurface(env, surface);
+        LOGI("ANativeWindow: %p", g_window);
+    }
+
+    LOGI("SurfaceView overlay + touch OK");
+    return true;
+}
+
+bool InstallGraphicsHook(JNIEnv* env) {
+    if (!env) { LOGI("JNIEnv nulo"); return false; }
+    if (!create_overlay_surface(env)) return false;
+    g_render_running = true;
+    pthread_t tid;
+    pthread_create(&tid, nullptr, render_thread, nullptr);
+    pthread_detach(tid);
+    LOGI("Overlay instalado");
+    return true;
+}
